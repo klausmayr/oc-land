@@ -62,9 +62,11 @@
     <script type="text/javascript">
       var map = L.map("map").setView([35.912064, -79.061636], 8);
 
-      var osm = new L.tileLayer(
-        "http://{s}.tile.osm.org/{z}/{x}/{y}.png"
-      ).addTo(map);
+//       var osm = new L.tileLayer(
+//         "http://{s}.tile.osm.org/{z}/{x}/{y}.png"
+//       ).addTo(map);
+      
+      var ocTiles = new L.tileLayer("server/oc-tiles-small.tilejson").addTo(map);
       
       // var ocTiles = new L.tileLayer("https://github.com/klausmayr/oc-land/blob/main/oc-tiles-small.mbtiles?raw=true",
       // tms: false).addTo(map);

@@ -1,784 +1,1307 @@
 <?php
-/**
- * A PHP TileMap Server
- *
- * Serves image tiles, UTFgrid tiles and TileJson definitions
- * from MBTiles files (as used by TileMill).
- *
- * @author  E. Akerboom (github@infostreams.net)
- * @version 1.3
- * @license LGPL
+
+/*
+ * TileServer-PHP project
+ * ======================
+ * https://github.com/maptiler/tileserver-php/
+ * Copyright (C) 2020 - MapTiler AG
  */
-header('Access-Control-Allow-Origin: *');
 
-$_identifier = '[\w\d_\-\s]+';
-$_number     = '\d+';
-$_retina     = '(\\@2x)?';
-
-$r = new Router();
-$r->map("",
-	array("controller" => "serverinfo", "action" => "hello"));
-
-$r->map("root.xml",
-	array("controller" => "TileMapService", "action" => "root"));
-
-$r->map("1.0.0",
-	array("controller" => "TileMapService", "action" => "service"));
-
-$r->map("1.0.0/:layer",
-	array("controller" => "TileMapService", "action" => "resource"), array("layer" => $_identifier));
-
-$r->map("1.0.0/:layer/:z/:x/:y:is_retina.:ext",
-	array("controller" => "maptile", "action" => "serveTmsTile"),
-	array("layer"     => $_identifier, "x" => $_number, "y" => $_number, "z" => $_number,
-	      "is_retina" => $_retina, "ext" => "(png|jpg|jpeg|json)"));
-
-$r->map(":layer/:z/:x/:y:is_retina.:ext",
-	array("controller" => "maptile", "action" => "serveTile"),
-	array("layer"     => $_identifier, "x" => $_number, "y" => $_number, "z" => $_number,
-	      "is_retina" => $_retina, "ext" => "(png|jpg|jpeg|json)"));
-
-$r->map(":layer/:z/:x/:y.:ext\\?:argument=:callback",
-	array("controller" => "maptile", "action" => "serveTile"),
-	array("layer" => $_identifier, "x" => $_number, "y" => $_number, "z" => $_number,
-	      "ext"   => "(json|jsonp)", "argument" => $_identifier, "callback" => $_identifier));
-
-$r->map(":layer/:z/:x/:y:is_retina.grid.:ext",
-	array("controller" => "maptile", "action" => "serveTile"),
-	array("layer"     => $_identifier, "x" => $_number, "y" => $_number, "z" => $_number,
-	      "is_retina" => $_retina, "ext" => "(json|jsonp)"));
-
-$r->map(":layer/:z/:x/:y:is_retina.grid.:ext\\?:argument=:callback",
-	array("controller" => "maptile", "action" => "serveTile"),
-	array("layer"     => $_identifier, "x" => $_number, "y" => $_number, "z" => $_number,
-	      "is_retina" => $_retina, "ext" => "(json|jsonp)",
-	      "argument"  => $_identifier, "callback" => $_identifier));
-
-$r->map(":layer.tilejson",
-	array("controller" => "maptile", "action" => "tilejson"), array("layer" => $_identifier));
-
-$r->map(":layer.tilejsonp\\?:argument=:callback",
-	array("controller" => "maptile", "action" => "tilejson"),
-	array("layer" => $_identifier, "argument" => $_identifier, "callback" => $_identifier));
-
-$r->run();
-
-
-class BaseClass {
-	protected $layer;
-	protected $is_retina = FALSE;
-	protected $db;
-
-	public function __construct() {
-
-	}
-
-	protected function getMBTilesName() {
-		$options = array();
-		if ($this->is_retina) {
-			// for retina requests, first check if a retina map exists
-			$options[] = "{$this->layer}@2x.mbtiles";
-		}
-		$options[] = "{$this->layer}.mbtiles";
-
-		foreach ($options as $o) {
-			if (file_exists($o)) {
-				return $o;
-			}
-		}
-
-		return FALSE;
-	}
-
-	protected function openDB() {
-		$filename = $this->getMBTilesName();
-
-		if ($filename !== FALSE) {
-			if (!extension_loaded('pdo_sqlite')) {
-				$this->error(500, "PDO SQLite extension is not installed");
-			}
-
-			$this->db = new PDO('sqlite:' . $filename, '', '');
-		}
-		if (!isset($this->db)) {
-			$this->error(404, "Incorrect tileset name: " . $this->layer);
-		}
-	}
-
-	protected function closeDB() {
-		// close the database
-		$this->db = NULL;
-	}
-
-	protected function error($nr, $message) {
-		$http_codes = array(
-			404 => 'Not Found',
-			500 => 'Internal Server Error',
-			// we don't need the rest anyway ;-)
-		);
-
-		header($_SERVER['SERVER_PROTOCOL'] . " $nr {$http_codes[$nr]}");
-		echo $message;
-		exit;
-	}
-
-}
-
-class ServerInfoController extends BaseClass {
-	public function __construct() {
-
-	}
-
-	public function hello() {
-		global $r;
-
-		$x = new TileMapServiceController();
-		echo "This is the " . $x->server_name . " version " . $x->server_version;
-		echo "<br /><br />Try these!";
-		echo "<ul>";
-		foreach ($r->routes as $route) {
-			if (strlen($route->url) > 0 && strpos($route->url, ":layer") === FALSE) {
-				$url = $route->url;
-				echo "<li><a href='$url'>$url</a></li>";
-			}
-		}
-
-		$layers = glob("*.mbtiles");
-		foreach ($layers as $l) {
-			$l    = str_replace(".mbtiles", "", $l);
-			$urls = array("$l/2/1/1.png", "$l.tilejson", "$l/2/1/1.json");
-			foreach ($urls as $u) {
-				echo "<li><a href='$u'>$u</a></li>";
-			}
-		}
-		echo "</ul>";
-	}
-
-}
-
-class MapTileController extends BaseClass {
-	protected $x;
-	protected $y;
-	protected $z;
-	protected $tileset;
-	protected $ext;
-	protected $is_tms;
-	protected $callback;
-
-	public function __construct() {
-		$this->is_tms = FALSE;
-	}
-
-	protected function set($layer, $x, $y, $z, $ext, $callback, $is_retina) {
-		$this->layer     = $layer;
-		$this->x         = $x;
-		$this->y         = $y;
-		$this->z         = $z;
-		$this->ext       = $ext;
-		$this->callback  = $callback;
-		$this->is_retina = is_bool($is_retina) ? $is_retina : strtolower(trim($is_retina)) == "@2x";
-	}
-
-	public function serveTile($layer, $x, $y, $z, $ext, $callback, $is_retina = FALSE) {
-		$this->set($layer, $x, $y, $z, $ext, $callback, $is_retina);
-
-		if (!$this->is_tms) {
-			$this->y = pow(2, $this->z) - 1 - $this->y;
-		}
-
-		switch (strtolower($this->ext)) {
-			case "json" :
-			case "jsonp" :
-				if (is_null($this->callback)) {
-					$this->jsonTile();
-				} else {
-					$this->jsonpTile();
-				}
-				break;
-
-			case "png" :
-			case "jpeg" :
-			case "jpg" :
-				$this->imageTile();
-				break;
-		}
-	}
-
-	public function serveTmsTile($tileset, $x, $y, $z, $ext, $callback, $is_retina) {
-		$this->is_tms = TRUE;
-
-		$this->serveTile($tileset . "-tms", $x, $y, $z, $ext, $callback, $is_retina);
-	}
-
-	protected function jsonTile() {
-		$etag = $this->etag("json");
-		$this->checkCache($etag);
-
-		$json = $this->getUTFgrid();
-
-		// disable ZLIB ouput compression
-		ini_set('zlib.output_compression', 'Off');
-
-		// serve JSON file
-		header('Content-Type: application/json; charset=utf-8');
-		header('Content-Length: ' . strlen($json));
-		$this->cachingHeaders($etag);
-
-		echo $json;
-	}
-
-	protected function jsonpTile() {
-		$etag = $this->etag("jsonp");
-		$this->checkCache($etag);
-
-		$json   = $this->getUTFgrid();
-		$output = $this->callback . "($json)";
-
-		// disable ZLIB output compression
-		ini_set('zlib.output_compression', 'Off');
-
-		// serve JSON file
-		header('Content-Type: application/json; charset=utf-8');
-		header('Content-Length: ' . strlen($output));
-		$this->cachingHeaders($etag);
-
-		echo $output;
-	}
-
-	protected function etag($type) {
-		return sha1(sprintf("%s-%s-%s-%s-%s-%s", $this->tileset, $this->x, $this->y, $this->z, $type, filemtime($this->getMBTilesName())));
-	}
-
-	protected function checkCache($etag) {
-		if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && $_SERVER['HTTP_IF_NONE_MATCH'] == $etag) {
-			header('HTTP/1.1 304 Not Modified');
-			exit();
-		}
-	}
-
-	protected function cachingHeaders($etag = NULL) {
-		$day     = 60 * 60 * 24;
-		$expires = 1 * $day;
-
-		// For an explanation on how the expires header and the etag header work together,
-		// please see http://stackoverflow.com/a/500103/426224
-		header("Expires: " . gmdate('D, d M Y H:i:s \G\M\T', time() + $expires));
-		header("Pragma: cache");
-		header("Cache-Control: max-age=$expires");
-		if (is_string($etag)) {
-			// Fix for https://github.com/infostreams/mbtiles-php/issues/11
-			header("ETag: \"{$etag}\"");
-		}
-	}
-
-	protected function imageTile() {
-		$etag = $this->etag("img");
-		$this->checkCache($etag);
-
-		if ($this->is_tms) {
-			$this->tileset = substr($this->tileset, 0, strlen($this->tileset) - 4);
-		}
-
-		try {
-			$this->openDB();
-
-			$result = $this->db->query('select tile_data as t from tiles where zoom_level=' . $this->z . ' and tile_column=' . $this->x . ' and tile_row=' . $this->y);
-			$data   = $result->fetchColumn();
-
-			if (!isset($data) || $data === FALSE) {
-				if (!extension_loaded('gd')) {
-					$this->error(500, "You need to install the GD image library.");
-				}
-				if (!function_exists('imagepng')) {
-					$this->error(500, "Your GD image library has no support for PNG images. Please correct and try again.");
-				}
-
-				// did not find a tile - return an empty (transparent) tile
-				$png = imagecreatetruecolor(256, 256);
-				imagesavealpha($png, TRUE);
-				$trans_colour = imagecolorallocatealpha($png, 0, 0, 0, 127);
-				imagefill($png, 0, 0, $trans_colour);
-				header('Content-type: image/png');
-				$this->cachingHeaders($etag);
-				imagepng($png);
-
-			} else {
-
-				// Hooray, found a tile!
-				// - figure out which format (jpeg or png) it is in
-				$result     = $this->db->query('select value from metadata where name="format"');
-				$resultdata = $result->fetchColumn();
-				$format     = isset($resultdata) && $resultdata !== FALSE ? $resultdata : 'png';
-				if ($format == 'jpg') {
-					$format = 'jpeg';
-				}
-
-				// - serve the tile
-				header('Content-type: image/' . $format);
-				$this->cachingHeaders($etag);
-				print $data;
-
-			}
-
-			// done
-			$this->closeDB();
-		} catch (PDOException $e) {
-			$this->closeDB();
-			$this->error(500, 'Error querying the database: ' . $e->getMessage());
-		}
-	}
-
-	protected function getUTFgrid() {
-		$this->openDB();
-
-		try {
-			$flip = TRUE;
-			if ($this->is_tms) {
-				$this->tileset = substr($this->tileset, 0, strlen($this->tileset) - 4);
-				$flip          = FALSE;
-			}
-
-			$result = $this->db->query('select grid as g from grids where zoom_level=' . $this->z . ' and tile_column=' . $this->x . ' and tile_row=' . $this->y);
-
-			$data = $result->fetchColumn();
-			if (!isset($data) || $data === FALSE) {
-				// nothing found - return empty JSON object
-				return "{}";
-			} else {
-				// get the gzipped json from the database
-				$grid = gzuncompress($data);
-
-				// manually add the data for the interactivity layer by means of string manipulation
-				// to prevent a bunch of costly calls to json_encode & json_decode
-				//
-				// first, strip off the last '}' character
-				$grid = substr(trim($grid), 0, -1);
-				// then, add a new key labelled 'data'
-				$grid .= ',"data":{';
-
-				// stuff that key with the actual data
-				$result = $this->db->query('select key_name as key, key_json as json from grid_data where zoom_level=' . $this->z . ' and tile_column=' . $this->x . ' and tile_row=' . $this->y);
-				while ($row = $result->fetch(PDO::FETCH_ASSOC)) {
-					$grid .= '"' . $row['key'] . '":' . $row['json'] . ',';
-				}
-
-				// finish up
-				$grid = rtrim($grid, ',') . "}}";
-
-				// done
-				return $grid;
-			}
-		} catch (PDOException $e) {
-			$this->closeDB();
-			$this->error(500, 'Error querying the database: ' . $e->getMessage());
-		}
-	}
-
-	public function tileJson($layer, $callback) {
-		$this->layer = $layer;
-		$this->openDB();
-		try {
-			$tilejson             = array();
-			$tilejson['tilejson'] = "2.0.0";
-			$tilejson['scheme']   = "xyz";
-
-			$result = $this->db->query('select name, value from metadata');
-			while ($row = $result->fetch(PDO::FETCH_ASSOC)) {
-				$key   = trim($row['name']);
-				$value = $row['value'];
-				if (in_array($key, array('maxzoom', 'minzoom'))) {
-					$value = intval($value);
-				}
-				$tilejson[$key] = $value;
-			}
-			if (array_key_exists('bounds', $tilejson)) {
-				$tilejson['bounds'] = array_map('floatval', explode(',', $tilejson['bounds']));
-			}
-			if (array_key_exists('center', $tilejson)) {
-				$tilejson['center'] = array_map('floatval', explode(',', $tilejson['center']));
-			}
-
-			// find out the absolute URL to this script
-			$protocol   = empty($_SERVER["HTTPS"]) ? "http" : "https";
-			$server_url = $protocol . "://" . $_SERVER["HTTP_HOST"] . dirname($_SERVER["REQUEST_URI"]);
-
-			$tilejson['tiles'] = array(
-				$server_url . "/" . urlencode($layer) . "/{z}/{x}/{y}.png"
-			);
-			$tilejson['grids'] = array(
-				$server_url . "/" . urlencode($layer) . "/{z}/{x}/{y}.json"
-			);
-
-			// Include a (mandatory) link to the webpage this map is included on
-			// Perhaps use referrer instead?
-			// 'Fixes' https://github.com/infostreams/mbtiles-php/issues/12
-			$tilejson['webpage'] = $server_url;
-
-			if ($callback !== NULL) {
-				$json = "$callback(" . json_encode($tilejson) . ")";
-			} else {
-				$json = json_encode($tilejson);
-			}
-
-			ini_set('zlib.output_compression', 'Off');
-			header('Content-Type: application/json');
-			header('Content-Length: ' . strlen($json));
-			$this->cachingHeaders();
-
-			echo $json;
-		} catch (PDOException $e) {
-			$this->closeDB();
-			$this->error(500, 'Error querying the database: ' . $e->getMessage());
-		}
-	}
-
-}
+global $config;
+$config['serverTitle'] = 'Maps hosted with TileServer-php v2.0';
+$config['availableFormats'] = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'pbf', 'hybrid'];
+$config['dataRoot'] = '';
+//$config['template'] = 'template.php';
+//$config['baseUrls'] = ['t0.server.com', 't1.server.com'];
+
+Router::serve([
+    '/' => 'Server:getHtml',
+    '/maps' => 'Server:getInfo',
+    '/html' => 'Server:getHtml',
+    '/:alpha/:number/:number/:number.grid.json' => 'Json:getUTFGrid',
+    '/:alpha.json' => 'Json:getJson',
+    '/:alpha.jsonp' => 'Json:getJsonp',
+    '/wmts' => 'Wmts:get',
+    '/wmts/1.0.0/WMTSCapabilities.xml' => 'Wmts:get',
+    '/wmts/:alpha/:number/:number/:alpha' => 'Wmts:getTile',
+    '/wmts/:alpha/:alpha/:number/:number/:alpha' => 'Wmts:getTile',
+    '/wmts/:alpha/:alpha/:alpha/:number/:number/:alpha' => 'Wmts:getTile',
+    '/:alpha/:number/:number/:alpha' => 'Wmts:getTile',
+    '/tms' => 'Tms:getCapabilities',
+    '/tms/:alpha' => 'Tms:getLayerCapabilities',
+]);
 
 /**
- * Implements a TileMapService that returns XML information on the provided
- * services.
- *
- * @see    http://wiki.osgeo.org/wiki/Tile_Map_Service_Specification
- * @author zverik (https://github.com/Zverik)
- * @author E. Akerboom (github@infostreams.net)
+ * Server base
  */
-class TileMapServiceController extends BaseClass {
+class Server {
 
-	public function __construct() {
-		$this->server_name    = "PHP TileMap server";
-		$this->server_version = "1.0.0";
-	}
+  /**
+   * Configuration of TileServer [baseUrls, serverTitle]
+   * @var array
+   */
+  public $config;
 
-	public function root() {
-		$base = $this->getBaseUrl();
+  /**
+   * Datasets stored in file structure
+   * @var array
+   */
+  public $fileLayer = [];
 
-		header('Content-type: text/xml');
-		echo <<<EOF
-<?xml version="1.0" encoding="UTF-8" ?>
-<Services>
-	<TileMapService title="{$this->server_name}" version="{$this->server_version}" href="${base}{$this->server_version}/" />
-</Services>
-EOF;
-	}
+  /**
+   * Datasets stored in database
+   * @var array
+   */
+  public $dbLayer = [];
 
-	public function service() {
-		$base = $this->getBaseUrl();
+  /**
+   * PDO database connection
+   * @var object
+   */
+  public $db;
 
-		header('Content-type: text/xml');
-		echo "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>";
-		echo "\n<TileMapService version=\"1.0.0\" services=\"$base\">";
-		echo "\n\t<Title>{$this->server_name} v{$this->server_version}</Title>";
-		echo "\n\t<Abstract />";
+  /**
+   * Set config
+   */
+  public function __construct() {
+    $this->config = $GLOBALS['config'];
 
-		echo "\n\t<TileMaps>";
+    if($this->config['dataRoot'] != ''
+       && substr($this->config['dataRoot'], -1) != '/' ){
+      $this->config['dataRoot'] .= '/';
+    }
 
-		if ($handle = opendir('.')) {
-			while (($file = readdir($handle)) !== FALSE) {
-				if (preg_match('/^[\w\d_-]+\.mbtiles$/', $file) && is_file($file)) {
-					try {
-						$db         = new PDO('sqlite:' . $file);
-						$params     = $this->readparams($db);
-						$name       = htmlspecialchars($params['name']);
-						$identifier = str_replace('.mbtiles', '', $file);
-						echo "\n\t\t<TileMap title=\"$name\" srs=\"OSGEO:41001\" profile=\"global-mercator\" href=\"${base}1.0.0/$identifier\" />";
-					} catch (PDOException $e) {
-						// nothing
-					}
-				}
-			}
-		}
+    //Get config from enviroment
+    $envServerTitle = getenv('serverTitle');
+    if($envServerTitle !== false){
+      $this->config['serverTitle'] = $envServerTitle;
+    }
+    $envBaseUrls = getenv('baseUrls');
+    if($envBaseUrls !== false){
+      $this->config['baseUrls'] = is_array($envBaseUrls) ?
+              $envBaseUrls : explode(',', $envBaseUrls);
+    }
+    $envTemplate = getenv('template');
+    if($envBaseUrls !== false){
+      $this->config['template'] = $envTemplate;
+    }
+  }
 
-		echo "\n\t</TileMaps>";
-		echo "\n</TileMapService>";
-	}
+  /**
+   * Looks for datasets
+   */
+  public function setDatasets() {
+    $mjs = glob('*/metadata.json');
+    $mbts = glob($this->config['dataRoot'] . '*.mbtiles');
+    if ($mjs) {
+      foreach (array_filter($mjs, 'is_readable') as $mj) {
+        $layer = $this->metadataFromMetadataJson($mj);
+        array_push($this->fileLayer, $layer);
+      }
+    }
+    if ($mbts) {
+      foreach (array_filter($mbts, 'is_readable') as $mbt) {
+        $this->dbLayer[] = $this->metadataFromMbtiles($mbt);
+      }
+    }
+  }
 
-	function resource($layer) {
-		try {
-			$this->layer = $layer;
-			$this->openDB();
-			$params = $this->readparams($this->db);
+  /**
+   * Processing params from router <server>/<layer>/<z>/<x>/<y>.ext
+   * @param array $params
+   */
+  public function setParams($params) {
+    if (isset($params[1])) {
+      $this->layer = $params[1];
+    }
+    $params = array_reverse($params);
+    if (isset($params[2])) {
+      $this->z = $params[2];
+      $this->x = $params[1];
+      $file = explode('.', $params[0]);
+      $this->y = $file[0];
+      $this->ext = isset($file[1]) ? $file[1] : null;
+    }
+  }
 
-			$title       = htmlspecialchars($params['name']);
-			$description = htmlspecialchars($params['description']);
-			$format      = $params['format'];
+  /**
+   * Get variable don't independent on sensitivity
+   * @param string $key
+   * @return boolean
+   */
+  public function getGlobal($isKey) {
+    $get = $_GET;
+    foreach ($get as $key => $value) {
+      if (strtolower($isKey) == strtolower($key)) {
+        return $value;
+      }
+    }
+    return false;
+  }
 
-			switch (strtolower($format)) {
-				case "jpg" :
-				case "jpeg" :
-					$mimetype = "image/jpeg";
-					break;
+  /**
+   * Testing if is a database layer
+   * @param string $layer
+   * @return boolean
+   */
+  public function isDBLayer($layer) {
+    if (is_file($this->config['dataRoot'] . $layer . '.mbtiles')) {
+      return true;
+    } else {
+      return false;
+    }
+  }
 
-				default :
-				case "png" :
-					$format   = "png";
-					$mimetype = "image/png";
-					break;
-			}
+  /**
+   * Testing if is a file layer
+   * @param string $layer
+   * @return boolean
+   */
+  public function isFileLayer($layer) {
+    if (is_dir($layer)) {
+      return true;
+    } else {
+      return false;
+    }
+  }
 
-			$base = $this->getBaseUrl();
-			header('Content-type: text/xml');
-			echo <<<EOF
-<?xml version="1.0" encoding="UTF-8" ?>
-<TileMap version="1.0.0" tilemapservice="{$base}1.0.0/">
-	<Title>$title</Title>
-	<Abstract>$description</Abstract>
-	<SRS>OSGEO:41001</SRS>
-	<BoundingBox minx="-180" miny="-90" maxx="180" maxy="90" />
-	<Origin x="0" y="0"/>
-	<TileFormat width="256" height="256" mime-type="$mimetype" extension="$format"/>
-	<TileSets profile="global-mercator">
-EOF;
-			foreach ($this->readzooms($this->db) as $zoom) {
-				$href     = $base . "1.0.0/" . $this->layer . "/" . $zoom;
-				$units_pp = 78271.516 / pow(2, $zoom);
+  /**
+   * Get metadata from metadataJson
+   * @param string $jsonFileName
+   * @return array
+   */
+  public function metadataFromMetadataJson($jsonFileName) {
+    $metadata = json_decode(file_get_contents($jsonFileName), true);
+    $metadata['basename'] = str_replace('/metadata.json', '', $jsonFileName);
+    return $this->metadataValidation($metadata);
+  }
 
-				echo "<TileSet href=\"$href\" units-per-pixel=\"$units_pp\" order=\"$zoom\" />";
-			}
-			echo <<<EOF
+  /**
+   * Loads metadata from MBtiles
+   * @param string $mbt
+   * @return object
+   */
+  public function metadataFromMbtiles($mbt) {
+    $metadata = [];
+    $this->DBconnect($mbt);
+    $result = $this->db->query('select * from metadata');
 
-	</TileSets>
-</TileMap>
-EOF;
-		} catch (PDOException $e) {
-			$this->error(404, "Incorrect tileset name: " . $this->layer);
-		}
-	}
+    $resultdata = $result->fetchAll();
+    foreach ($resultdata as $r) {
+      $value = preg_replace('/(\\n)+/', '', $r['value']);
+      $metadata[$r['name']] = addslashes($value);
+    }
+    if (!array_key_exists('minzoom', $metadata)
+    || !array_key_exists('maxzoom', $metadata)
+    ) {
+      // autodetect minzoom and maxzoom
+      $result = $this->db->query('select min(zoom_level) as min, max(zoom_level) as max from tiles');
+      $resultdata = $result->fetchAll();
+      if (!array_key_exists('minzoom', $metadata)){
+        $metadata['minzoom'] = $resultdata[0]['min'];
+      }
+      if (!array_key_exists('maxzoom', $metadata)){
+        $metadata['maxzoom'] = $resultdata[0]['max'];
+      }
+    }
+    // autodetect format using JPEG magic number FFD8
+    if (!array_key_exists('format', $metadata)) {
+      $result = $this->db->query('select hex(substr(tile_data,1,2)) as magic from tiles limit 1');
+      $resultdata = $result->fetchAll();
+      $metadata['format'] = ($resultdata[0]['magic'] == 'FFD8')
+        ? 'jpg'
+        : 'png';
+    }
+    // autodetect bounds
+    if (!array_key_exists('bounds', $metadata)) {
+      $result = $this->db->query('select min(tile_column) as w, max(tile_column) as e, min(tile_row) as s, max(tile_row) as n from tiles where zoom_level='.$metadata['maxzoom']);
+      $resultdata = $result->fetchAll();
+      $w = -180 + 360 * ($resultdata[0]['w'] / pow(2, $metadata['maxzoom']));
+      $e = -180 + 360 * ((1 + $resultdata[0]['e']) / pow(2, $metadata['maxzoom']));
+      $n = $this->row2lat($resultdata[0]['n'], $metadata['maxzoom']);
+      $s = $this->row2lat($resultdata[0]['s'] - 1, $metadata['maxzoom']);
+      $metadata['bounds'] = implode(',', [$w, $s, $e, $n]);
+    }
+    $mbt = explode('.', $mbt);
+    $metadata['basename'] = $mbt[0];
+    $metadata = $this->metadataValidation($metadata);
+    return $metadata;
+  }
 
-	function readparams($db) {
-		$params = array();
-		$result = $db->query('select name, value from metadata');
-		while ($row = $result->fetch(PDO::FETCH_ASSOC)) {
-			$params[$row['name']] = $row['value'];
-		}
+  /**
+   * Convert row number to latitude of the top of the row
+   * @param integer $r
+   * @param integer $zoom
+   * @return integer
+   */
+   public function row2lat($r, $zoom) {
+     $y = $r / pow(2, $zoom - 1 ) - 1;
+     return rad2deg(2.0 * atan(exp(3.191459196 * $y)) - 1.57079632679489661922);
+   }
 
-		return $params;
-	}
+  /**
+   * Valids metaJSON
+   * @param object $metadata
+   * @return object
+   */
+  public function metadataValidation($metadata) {
+    if (!array_key_exists('bounds', $metadata)) {
+      $metadata['bounds'] = [-180, -85.06, 180, 85.06];
+    } elseif (!is_array($metadata['bounds'])) {
+      $metadata['bounds'] = array_map('floatval', explode(',', $metadata['bounds']));
+    }
+    if (!array_key_exists('profile', $metadata)) {
+      $metadata['profile'] = 'mercator';
+    }
+    if (array_key_exists('minzoom', $metadata)){
+      $metadata['minzoom'] = intval($metadata['minzoom']);
+    }else{
+      $metadata['minzoom'] = 0;
+    }
+    if (array_key_exists('maxzoom', $metadata)){
+      $metadata['maxzoom'] = intval($metadata['maxzoom']);
+    }else{
+      $metadata['maxzoom'] = 18;
+    }
+    if (!array_key_exists('format', $metadata)) {
+      if(array_key_exists('tiles', $metadata)){
+        $pos = strrpos($metadata['tiles'][0], '.');
+        $metadata['format'] = trim(substr($metadata['tiles'][0], $pos + 1));
+      }
+    }
+    $formats = $this->config['availableFormats'];
+    if(!in_array(strtolower($metadata['format']), $formats)){
+        $metadata['format'] = 'png';
+    }
+    if (!array_key_exists('scale', $metadata)) {
+      $metadata['scale'] = 1;
+    }
+    if(!array_key_exists('tiles', $metadata)){
+      $tiles = [];
+      foreach ($this->config['baseUrls'] as $url) {
+        $url = '' . $this->config['protocol'] . '://' . $url . '/' .
+                $metadata['basename'] . '/{z}/{x}/{y}';
+        if(strlen($metadata['format']) <= 4){
+          $url .= '.' . $metadata['format'];
+        }
+        $tiles[] = $url;
+      }
+      $metadata['tiles'] = $tiles;
+    }
+    return $metadata;
+  }
 
-	function readzooms($db) {
-		$params  = $this->readparams($db);
-		$minzoom = $params['minzoom'];
-		$maxzoom = $params['maxzoom'];
+  /**
+   * SQLite connection
+   * @param string $tileset
+   */
+  public function DBconnect($tileset) {
+    try {
+      $this->db = new PDO('sqlite:' . $tileset, '', '', [PDO::ATTR_PERSISTENT => true]);
+    } catch (Exception $exc) {
+      echo $exc->getTraceAsString();
+      die;
+    }
 
-		return range($minzoom, $maxzoom);
-	}
+    if (!isset($this->db)) {
+      header('Content-type: text/plain');
+      echo 'Incorrect tileset name: ' . $tileset;
+      die;
+    }
+  }
 
-	function getBaseUrl() {
-		$protocol = empty($_SERVER["HTTPS"]) ? "http" : "https";
+  /**
+   * Check if file is modified and set Etag headers
+   * @param string $filename
+   * @return boolean
+   */
+  public function isModified($filename) {
+    $filename = $this->config['dataRoot'] . $filename . '.mbtiles';
+    $lastModifiedTime = filemtime($filename);
+    $eTag = md5($lastModifiedTime);
+    header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $lastModifiedTime) . ' GMT');
+    header('Etag:' . $eTag);
+    if (@strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']) == $lastModifiedTime ||
+            @trim($_SERVER['HTTP_IF_NONE_MATCH']) == $eTag) {
+      return true;
+    } else {
+      return false;
+    }
+  }
 
-		return $protocol . '://' . $_SERVER['HTTP_HOST'] . preg_replace('/\/(1.0.0\/)?[^\/]*$/', '/', $_SERVER['REQUEST_URI']);
-	}
+  /**
+   * Returns tile of dataset
+   * @param string $tileset
+   * @param integer $z
+   * @param integer $y
+   * @param integer $x
+   * @param string $ext
+   */
+  public function renderTile($tileset, $z, $y, $x, $ext) {
+    if ($this->isDBLayer($tileset)) {
+      if ($this->isModified($tileset) == true) {
+        header('Access-Control-Allow-Origin: *');
+        header('HTTP/1.1 304 Not Modified');
+        die;
+      }
+      $this->DBconnect($this->config['dataRoot'] . $tileset . '.mbtiles');
+      $z = floatval($z);
+      $y = floatval($y);
+      $x = floatval($x);
+      $flip = true;
+      if ($flip) {
+        $y = pow(2, $z) - 1 - $y;
+      }
+      $result = $this->db->query('select tile_data as t from tiles where zoom_level=' . $z . ' and tile_column=' . $x . ' and tile_row=' . $y);
+      $data = $result->fetchColumn();
+      if (!isset($data) || $data === false) {
+        //if tile doesn't exist
+        //select scale of tile (for retina tiles)
+        $result = $this->db->query('select value from metadata where name="scale"');
+        $resultdata = $result->fetchColumn();
+        $scale = isset($resultdata) && $resultdata !== false ? $resultdata : 1;
+        $this->getCleanTile($scale, $ext);
+      } else {
+        $result = $this->db->query('select value from metadata where name="format"');
+        $resultdata = $result->fetchColumn();
+        $format = isset($resultdata) && $resultdata !== false ? $resultdata : 'png';
+        if ($format == 'jpg') {
+          $format = 'jpeg';
+        }
+        if ($format == 'pbf') {
+          header('Content-type: application/x-protobuf');
+          header('Content-Encoding:gzip');
+        } else {
+          header('Content-type: image/' . $format);
+        }
+        header('Access-Control-Allow-Origin: *');
+        echo $data;
+      }
+    } elseif ($this->isFileLayer($tileset)) {
+      $name = './' . $tileset . '/' . $z . '/' . $x . '/' . $y;
+      $mime = 'image/';
+      if($ext != null){
+        $name .= '.' . $ext;
+      }
+      if ($fp = @fopen($name, 'rb')) {
+        if($ext != null){
+          $mime .= $ext;
+        }else{
+          //detect image type from file
+          $mimetypes = ['gif', 'jpeg', 'png'];
+          $mime .= $mimetypes[exif_imagetype($name) - 1];
+        }
+        header('Access-Control-Allow-Origin: *');
+        header('Content-Type: ' . $mime);
+        header('Content-Length: ' . filesize($name));
+        fpassthru($fp);
+        die;
+      } else {
+        //scale of tile (for retina tiles)
+        $meta = json_decode(file_get_contents($tileset . '/metadata.json'));
+        if(!isset($meta->scale)){
+          $meta->scale = 1;
+        }
+      }
+      $this->getCleanTile($meta->scale, $ext);
+    } else {
+      header('HTTP/1.1 404 Not Found');
+      echo 'Server: Unknown or not specified dataset "' . $tileset . '"';
+      die;
+    }
+  }
+
+  /**
+   * Returns clean tile
+   * @param integer $scale Default 1
+   */
+  public function getCleanTile($scale = 1, $format = 'png') {
+    switch ($format) {
+      case 'pbf':
+        header('Access-Control-Allow-Origin: *');
+        header('HTTP/1.1 204 No Content');
+        header('Content-Type: application/json; charset=utf-8');
+        break;
+      case 'webp':
+        header('Access-Control-Allow-Origin: *');
+        header('Content-type: image/webp');
+        echo base64_decode('UklGRhIAAABXRUJQVlA4TAYAAAAvQWxvAGs=');
+        break;
+      case 'jpg':
+        header('Access-Control-Allow-Origin: *');
+        header('Content-type: image/jpg');
+        echo base64_decode('/9j/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/yQALCAABAAEBAREA/8wABgAQEAX/2gAIAQEAAD8A0s8g/9k=');
+        break;
+      case 'png':
+      default:
+        header('Access-Control-Allow-Origin: *');
+        header('Content-type: image/png');
+        // 256x256 transparent optimised png tile
+        echo pack('H*', '89504e470d0a1a0a0000000d494844520000010000000100010300000066bc3a2500000003504c5445000000a77a3dda0000000174524e530040e6d8660000001f494441541819edc1010d000000c220fba77e0e37600000000000000000e70221000001f5a2bd040000000049454e44ae426082');
+        break;
+    }
+    die;
+  }
+
+  /**
+   * Returns tile's UTFGrid
+   * @param string $tileset
+   * @param integer $z
+   * @param integer $y
+   * @param integer $x
+   */
+  public function renderUTFGrid($tileset, $z, $y, $x, $flip = true) {
+    if ($this->isDBLayer($tileset)) {
+      if ($this->isModified($tileset) == true) {
+        header('HTTP/1.1 304 Not Modified');
+      }
+      if ($flip) {
+        $y = pow(2, $z) - 1 - $y;
+      }
+      try {
+        $this->DBconnect($this->config['dataRoot'] . $tileset . '.mbtiles');
+
+        $query = 'SELECT grid FROM grids WHERE tile_column = ' . $x . ' AND '
+                . 'tile_row = ' . $y . ' AND zoom_level = ' . $z;
+        $result = $this->db->query($query);
+        $data = $result->fetch(PDO::FETCH_ASSOC);
+
+        if ($data !== false) {
+          $grid = gzuncompress($data['grid']);
+          $grid = substr(trim($grid), 0, -1);
+
+          //adds legend (data) to output
+          $grid .= ',"data":{';
+          $kquery = 'SELECT key_name as key, key_json as json FROM grid_data '
+                  . 'WHERE zoom_level=' . $z . ' and '
+                  . 'tile_column=' . $x . ' and tile_row=' . $y;
+          $result = $this->db->query($kquery);
+          while ($r = $result->fetch(PDO::FETCH_ASSOC)) {
+            $grid .= '"' . $r['key'] . '":' . $r['json'] . ',';
+          }
+          $grid = rtrim($grid, ',') . '}}';
+          header('Access-Control-Allow-Origin: *');
+
+          if (isset($_GET['callback']) && !empty($_GET['callback'])) {
+            header('Content-Type:text/javascript charset=utf-8');
+            echo $_GET['callback'] . '(' . $grid . ');';
+          } else {
+            header('Content-Type:text/javascript; charset=utf-8');
+            echo $grid;
+          }
+        } else {
+          header('Access-Control-Allow-Origin: *');
+          echo '{}';
+          die;
+        }
+      } catch (Exception $e) {
+        header('Content-type: text/plain');
+        print 'Error querying the database: ' . $e->getMessage();
+      }
+    } else {
+      echo 'Server: no MBTiles tileset';
+      die;
+    }
+  }
+
+  /**
+   * Returns server info
+   */
+  public function getInfo() {
+    $this->setDatasets();
+    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    header('Content-Type: text/html;charset=UTF-8');
+    echo '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' . $this->config['serverTitle'] . '</title></head><body>' .
+      '<h1>' . $this->config['serverTitle'] . '</h1>' .
+      'TileJSON service: <a href="//' . $this->config['baseUrls'][0] . '/index.json">' . $this->config['baseUrls'][0] . '/index.json</a><br>' .
+      'WMTS service: <a href="//' . $this->config['baseUrls'][0] . '/wmts">' . $this->config['baseUrls'][0] . '/wmts</a><br>' .
+      'TMS service: <a href="//' . $this->config['baseUrls'][0] . '/tms">' . $this->config['baseUrls'][0] . '/tms</a>';
+    foreach ($maps as $map) {
+      $extend = '[' . implode($map['bounds'], ', ') . ']';
+      echo '<p>Tileset: <b>' . $map['basename'] . '</b><br>' .
+        'Metadata: <a href="//' . $this->config['baseUrls'][0] . '/' . $map['basename'] . '.json">' .
+        $this->config['baseUrls'][0] . '/' . $map['basename'] . '.json</a><br>' .
+        'Bounds: ' . $extend ;
+      if(isset($map['crs'])){echo '<br>CRS: ' . $map['crs'];}
+       echo '</p>';
+    }
+    echo '<p>Copyright (C) 2016 - Klokan Technologies GmbH</p>';
+    echo '</body></html>';
+  }
+
+  /**
+   * Returns html viewer
+   */
+  public function getHtml() {
+    $this->setDatasets();
+    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    if (isset($this->config['template']) && file_exists($this->config['template'])) {
+      $baseUrls = $this->config['baseUrls'];
+      $serverTitle = $this->config['serverTitle'];
+      include_once $this->config['template'];
+    } else {
+      header('Content-Type: text/html;charset=UTF-8');
+      echo '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' . $this->config['serverTitle'] . '</title>';
+      echo '<link rel="stylesheet" type="text/css" href="//cdn.klokantech.com/tileviewer/v1/index.css" />
+            <script src="//cdn.klokantech.com/tileviewer/v1/index.js"></script><body>
+            <script>tileserver({index:"' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/index.json", tilejson:"' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/%n.json", tms:"' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/tms", wmts:"' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/wmts"});</script>
+            <h1>Welcome to ' . $this->config['serverTitle'] . '</h1>
+            <p>This server distributes maps to desktop, web, and mobile applications.</p>
+            <p>The mapping data are available as OpenGIS Web Map Tiling Service (OGC WMTS), OSGEO Tile Map Service (TMS), and popular XYZ urls described with TileJSON metadata.</p>';
+      if (!isset($maps)) {
+        echo '<h3 style="color:darkred;">No maps available yet</h3>
+              <p style="color:darkred; font-style: italic;">
+              Ready to go - just upload some maps into directory:' . getcwd() . '/ on this server.</p>
+              <p>Note: The maps can be a directory with tiles in XYZ format with metadata.json file.<br/>
+              You can easily convert existing geodata (GeoTIFF, ECW, MrSID, etc) to this tile structure with <a href="http://www.maptiler.com">MapTiler Cluster</a> or open-source projects such as <a href="http://www.klokan.cz/projects/gdal2tiles/">GDAL2Tiles</a> or <a href="http://www.maptiler.org/">MapTiler</a> or simply upload any maps in MBTiles format made by <a href="http://www.tilemill.com/">TileMill</a>. Helpful is also the <a href="https://github.com/mapbox/mbutil">mbutil</a> tool. Serving directly from .mbtiles files is supported, but with decreased performance.</p>';
+      } else {
+        echo '<ul>';
+        foreach ($maps as $map) {
+          echo "<li>" . $map['name'] . '</li>';
+        }
+        echo '</ul>';
+      }
+      echo '</body></html>';
+    }
+  }
+
 }
-
 
 /**
- * Rails like routing for PHP
- *
- * Based on http://blog.sosedoff.com/2009/09/20/rails-like-php-url-router/
- * but extended in significant ways:
- *
- * 1. Can now be deployed in a subdirectory, not just the domain root
- * 2. Will now call the indicated controller & action. Named arguments are
- *    converted to similarly method arguments, i.e. if you specify :id in the
- *    URL mapping, the value of that parameter will be provided to the method's
- *    '$id' parameter, if present.
- * 3. Will now allow URL mappings that contain a '?' - useful for mapping JSONP urls
- * 4. Should now correctly deal with spaces (%20) and other stuff in the URL
- *
- * @version 2.0
- * @author  Dan Sosedoff <http://twitter.com/dan_sosedoff>
- * @author  E. Akerboom <github@infostreams.net>
+ * JSON service
  */
-define('ROUTER_DEFAULT_CONTROLLER', 'home');
-define('ROUTER_DEFAULT_ACTION', 'index');
+class Json extends Server {
 
-class Router extends BaseClass {
-	public $request_uri;
-	public $routes;
-	public $controller, $controller_name;
-	public $action, $id;
-	public $params;
-	public $route_found = FALSE;
+  /**
+   * Callback for JSONP default grid
+   * @var string
+   */
+  private $callback = 'grid';
 
-	public function __construct() {
-		$request = $this->get_request();
+  /**
+   * @param array $params
+   */
+  public $layer = 'index';
 
-		$this->request_uri = $request;
-		$this->routes      = array();
-	}
+  /**
+   * @var integer
+   */
+  public $z;
 
-	public function get_request() {
-		// find out the absolute path to this script
-		// - adjusted as per https://github.com/infostreams/mbtiles-php/issues/17
-		$here = str_replace("\\", "/", rtrim(dirname($_SERVER["SCRIPT_FILENAME"]), '/') . "/");
+  /**
+   * @var integer
+   */
+  public $y;
 
-		// find out the absolute path to the document root
-		$document_root = str_replace("\\", "/", realpath($_SERVER["DOCUMENT_ROOT"]) . "/");
+  /**
+   * @var integer
+   */
+  public $x;
 
-		// let's see if we can return a path that is expressed *relative* to the script
-		// (i.e. if this script is in '/sites/something/router.php', and we are
-		// requesting /sites/something/here/is/my/path.png, then this function will 
-		// return 'here/is/my/path.png')
-		if (strpos($here, $document_root) !== FALSE) {
-			$relative_path = "/" . str_replace($document_root, "", $here);
+  /**
+   * @var string
+   */
+  public $ext;
 
-			# fix for https://github.com/infostreams/mbtiles-php/issues/4
-			$path = $_SERVER["REQUEST_URI"];
-			if ($relative_path === '/') {
-				$path = preg_replace('/^\/+/', '', $path);
-			} else {
-				$path = urldecode(str_replace($relative_path, "", $_SERVER["REQUEST_URI"]));
-			}
+  /**
+   *
+   * @param array $params
+   */
+  public function __construct($params) {
+    parent::__construct();
+    parent::setParams($params);
+    if (isset($_GET['callback']) && !empty($_GET['callback'])) {
+      $this->callback = $_GET['callback'];
+    }
+  }
 
-			return $path;
-		}
+  /**
+   * Adds metadata about layer
+   * @param array $metadata
+   * @return array
+   */
+  public function metadataTileJson($metadata) {
+    $metadata['tilejson'] = '2.0.0';
+    $metadata['scheme'] = 'xyz';
+    if ($this->isDBLayer($metadata['basename'])) {
+      $this->DBconnect($this->config['dataRoot'] . $metadata['basename'] . '.mbtiles');
+      $res = $this->db->query('SELECT name FROM sqlite_master WHERE name="grids";');
+      if ($res) {
+        foreach ($this->config['baseUrls'] as $url) {
+          $grids[] = '' . $this->config['protocol'] . '://' . $url . '/' . $metadata['basename'] . '/{z}/{x}/{y}.grid.json';
+        }
+        $metadata['grids'] = $grids;
+      }
+    }
+    if (array_key_exists('json', $metadata)) {
+      $mjson = json_decode(stripslashes($metadata['json']));
+      foreach ($mjson as $key => $value) {
+        if ($key != 'Layer'){
+          $metadata[$key] = $value;
+        }
+      }
+      unset($metadata['json']);
+    }
+    return $metadata;
+  }
 
-		// nope - we couldn't get the relative path... too bad! Return the absolute path
-		// instead.
-		return urldecode($_SERVER["REQUEST_URI"]);
-	}
+  /**
+   * Creates JSON from array
+   * @param string $basename
+   * @return string
+   */
+  private function createJson($basename) {
+    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    if ($basename == 'index') {
+      $output = '[';
+      foreach ($maps as $map) {
+        $output = $output . json_encode($this->metadataTileJson($map)) . ',';
+      }
+      if (strlen($output) > 1) {
+        $output = substr_replace($output, ']', -1);
+      } else {
+        $output = $output . ']';
+      }
+    } else {
+      foreach ($maps as $map) {
+        if (strpos($map['basename'], $basename) !== false) {
+          $output = json_encode($this->metadataTileJson($map));
+          break;
+        }
+      }
+    }
+    if (!isset($output)) {
+      echo 'TileServer: unknown map ' . $basename;
+      die;
+    }
+    return stripslashes($output);
+  }
 
-	public function map($rule, $target = array(), $conditions = array()) {
-		$this->routes[$rule] = new Route($rule, $this->request_uri, $target, $conditions);
-	}
+  /**
+   * Returns JSON with callback
+   */
+  public function getJson() {
+    parent::setDatasets();
+    header('Access-Control-Allow-Origin: *');
+    header('Content-Type: application/json; charset=utf-8');
+    if ($this->callback !== 'grid') {
+      echo $this->callback . '(' . $this->createJson($this->layer) . ');'; die;
+    } else {
+      echo $this->createJson($this->layer); die;
+    }
+  }
 
-	public function default_routes() {
-		$this->map(':controller');
-		$this->map(':controller/:action');
-		$this->map(':controller/:action/:id');
-	}
+  /**
+   * Returns JSONP with callback
+   */
+  public function getJsonp() {
+    parent::setDatasets();
+    header('Access-Control-Allow-Origin: *');
+    header('Content-Type: application/javascript; charset=utf-8');
+    echo $this->callback . '(' . $this->createJson($this->layer) . ');';
+  }
 
-	private function set_route($route) {
-		$this->route_found = TRUE;
-		$params            = $route->params;
-		$this->controller  = $params['controller'];
-		unset($params['controller']);
-		$this->action = $params['action'];
-		unset($params['action']);
-		if (isset($params['id'])) {
-			$this->id = $params['id'];
-		}
-		$this->params = array_merge($params, $_GET);
-
-		if (empty($this->controller)) {
-			$this->controller = ROUTER_DEFAULT_CONTROLLER;
-		}
-		if (empty($this->action)) {
-			$this->action = ROUTER_DEFAULT_ACTION;
-		}
-		if (empty($this->id)) {
-			$this->id = NULL;
-		}
-
-		// determine controller name
-		$this->controller_name = implode(array_map('ucfirst', explode('_', $this->controller . "_controller")));
-	}
-
-	public function match_routes() {
-		foreach ($this->routes as $route) {
-			if ($route->is_matched) {
-				$this->set_route($route);
-				break;
-			}
-		}
-	}
-
-	public function run() {
-		$this->match_routes();
-
-		if ($this->route_found) {
-			// we found a route!
-			if (class_exists($this->controller_name)) {
-				// ... the controller exists
-				$controller = new $this->controller_name();
-				if (method_exists($controller, $this->action)) {
-					// ... and the action as well! Now, we have to figure out
-					//	 how we need to call this method:
-
-					// iterate this method's parameters and compare them with the parameter names
-					// we defined in the route. Then, reassemble the values from the URL and put
-					// them in the same order as method's argument list.
-					$m      = new ReflectionMethod($controller, $this->action);
-					$params = $m->getParameters();
-					$args   = array();
-					foreach ($params as $i => $p) {
-						if (isset($this->params[$p->name])) {
-							$args[$i] = urldecode($this->params[$p->name]);
-						} else {
-							// we couldn't find this parameter in the URL! Set it to 'null' to indicate this.
-							$args[$i] = NULL;
-						}
-					}
-
-					// Finally, we call the function with the resulting list of arguments
-					call_user_func_array(array($controller, $this->action), $args);
-				} else {
-					$this->error(404, "Action " . $this->controller_name . "." . $this->action . "() not found");
-				}
-			} else {
-				$this->error(404, "Controller " . $this->controller_name . " not found");
-			}
-		} else {
-			$this->error(404, "Page not found");
-		}
-	}
+  /**
+   * Returns UTFGrid in JSON format
+   */
+  public function getUTFGrid() {
+    parent::renderUTFGrid($this->layer, $this->z, $this->y, $this->x);
+  }
 
 }
 
-class Route {
-	public $is_matched = FALSE;
-	public $params;
-	public $url;
-	private $conditions;
+/**
+ * Web map tile service
+ */
+class Wmts extends Server {
 
-	function __construct($url, $request_uri, $target, $conditions) {
-		$this->url        = $url;
-		$this->params     = array();
-		$this->conditions = $conditions;
-		$p_names          = array();
-		$p_values         = array();
+  /**
+   * @param array $params
+   */
+  public $layer;
 
-		// extract pattern names (catches :controller, :action, :id, etc)
-		preg_match_all('@:([\w]+)@', $url, $p_names, PREG_PATTERN_ORDER);
-		$p_names = $p_names[0];
+  /**
+   * @var integer
+   */
+  public $z;
 
-		// make a version of the request with and without the '?x=y&z=a&...' part
-		$pos = strpos($request_uri, '?');
-		if ($pos) {
-			$request_uri_without = substr($request_uri, 0, $pos);
-		} else {
-			$request_uri_without = $request_uri;
+  /**
+   * @var integer
+   */
+  public $y;
+
+  /**
+   * @var integer
+   */
+  public $x;
+
+  /**
+   * @var string
+   */
+  public $ext;
+
+  /**
+   *
+   * @param array $params
+   */
+  public function __construct($params) {
+    parent::__construct();
+    if (isset($params)) {
+      parent::setParams($params);
+    }
+  }
+
+  /**
+   * Tests request from url and call method
+   */
+  public function get() {
+    $request = $this->getGlobal('Request');
+    if ($request !== false && $request == 'gettile') {
+      $this->getTile();
+    } else {
+      parent::setDatasets();
+      $this->getCapabilities();
+    }
+  }
+
+  /**
+   * Validates tilematrixset, calculates missing params
+   * @param Object $tileMatrix
+   * @return Object
+   */
+  public function parseTileMatrix($layer, $tileMatrix){
+
+    //process projection
+    if(isset($layer['proj4'])){
+      preg_match_all("/([^+= ]+)=([^= ]+)/", $layer['proj4'], $res);
+      $proj4 = array_combine($res[1], $res[2]);
+    }
+
+    for($i = 0; $i < count($tileMatrix); $i++){
+
+      if(!isset($tileMatrix[$i]['id'])){
+        $tileMatrix[$i]['id'] =  (string) $i;
+      }
+      if (!isset($tileMatrix[$i]['extent']) && isset($layer['extent'])) {
+        $tileMatrix[$i]['extent'] = $layer['extent'];
+      }
+      if (!isset($tileMatrix[$i]['matrix_size'])) {
+        $tileExtent = $this->tilesOfExtent(
+              $tileMatrix[$i]['extent'],
+              $tileMatrix[$i]['origin'],
+              $tileMatrix[$i]['pixel_size'],
+              $tileMatrix[$i]['tile_size']
+        );
+        $tileMatrix[$i]['matrix_size'] = [
+            $tileExtent[2] + 1,
+            $tileExtent[1] + 1
+        ];
+      }
+      if(!isset($tileMatrix[$i]['origin']) && isset($tileMatrix[$i]['extent'])){
+        $tileMatrix[$i]['origin'] = [
+            $tileMatrix[$i]['extent'][0], $tileMatrix[$i]['extent'][3]
+        ];
+      }
+      // Origins of geographic coordinate systems are setting in opposite order
+      if (isset($proj4) && $proj4['proj'] === 'longlat') {
+        $tileMatrix[$i]['origin'] = array_reverse($tileMatrix[$i]['origin']);
+      }
+      if(!isset($tileMatrix[$i]['scale_denominator'])){
+        $tileMatrix[$i]['scale_denominator'] = count($tileMatrix) - $i;
+      }
+      if(!isset($tileMatrix[$i]['tile_size'])){
+        $tileSize = 256 * (int) $layer['scale'];
+        $tileMatrix[$i]['tile_size'] = [$tileSize, $tileSize];
+      }
+    }
+
+    return $tileMatrix;
+  }
+
+  /**
+   * Calculates corners of tilematrix
+   * @param array $extent
+   * @param array $origin
+   * @param array $pixel_size
+   * @param array $tile_size
+   * @return array
+   */
+  public function tilesOfExtent($extent, $origin, $pixel_size, $tile_size) {
+    $tiles = [
+      $this->minsample($extent[0] - $origin[0], $pixel_size[0] * $tile_size[0]),
+      $this->minsample($extent[1] - $origin[1], $pixel_size[1] * $tile_size[1]),
+      $this->maxsample($extent[2] - $origin[0], $pixel_size[0] * $tile_size[0]),
+      $this->maxsample($extent[3] - $origin[1], $pixel_size[1] * $tile_size[1]),
+    ];
+    return $tiles;
+  }
+
+  private function minsample($x, $f){
+    return $f > 0 ? floor($x / $f) : ceil(($x / $f) - 1);
+  }
+
+  private function maxsample($x, $f){
+    return $f < 0 ? floor($x / $f) : ceil(($x / $f) - 1);
+  }
+
+  /**
+   * Default TileMetrixSet for Pseudo Mercator projection 3857
+   * @param ?number $maxZoom
+   * @return string TileMatrixSet xml
+   */
+  public function getMercatorTileMatrixSet($maxZoom = 18){
+    $denominatorBase = 559082264.0287178;
+    $extent = [-20037508.34,-20037508.34,20037508.34,20037508.34];
+    $tileMatrixSet = [];
+
+    for($i = 0; $i <= $maxZoom; $i++){
+      $matrixSize = pow(2, $i);
+      $tileMatrixSet[] = [
+        'extent' => $extent,
+        'id' => (string) $i,
+        'matrix_size' => [$matrixSize, $matrixSize],
+        'origin' => [$extent[0], $extent[3]],
+        'scale_denominator' => $denominatorBase / pow(2, $i),
+        'tile_size' => [256, 256]
+      ];
+    }
+
+    return $this->getTileMatrixSet('GoogleMapsCompatible', $tileMatrixSet, 'EPSG:3857');
+  }
+
+  /**
+   * Default TileMetrixSet for WGS84 projection 4326
+   * @return string Xml
+   */
+  public function getWGS84TileMatrixSet(){
+    $extent = [-180.000000, -90.000000, 180.000000, 90.000000];
+    $scaleDenominators = [279541132.01435887813568115234, 139770566.00717943906784057617,
+      69885283.00358971953392028809, 34942641.50179485976696014404, 17471320.75089742988348007202,
+      8735660.37544871494174003601, 4367830.18772435747087001801, 2183915.09386217873543500900,
+      1091957.54693108936771750450, 545978.77346554468385875225, 272989.38673277234192937613,
+      136494.69336638617096468806, 68247.34668319308548234403, 34123.67334159654274117202,
+      17061.83667079825318069197, 8530.91833539912659034599, 4265.45916769956329517299,
+      2132.72958384978574031265];
+    $tileMatrixSet = [];
+
+    for($i = 0; $i <= 17; $i++){
+      $matrixSize = pow(2, $i);
+      $tileMatrixSet[] = [
+        'extent' => $extent,
+        'id' => (string) $i,
+        'matrix_size' => [$matrixSize * 2, $matrixSize],
+        'origin' => [$extent[3], $extent[0]],
+        'scale_denominator' => $scaleDenominators[$i],
+        'tile_size' => [256, 256]
+      ];
+    }
+
+    return $this->getTileMatrixSet('WGS84', $tileMatrixSet, 'EPSG:4326');
+  }
+
+  /**
+   * Prints WMTS TileMatrixSet
+   * @param string $name
+   * @param array $tileMatrixSet Array of levels
+   * @param string $crs Code of crs eg: EPSG:3857
+   * @return string TileMatrixSet xml
+   */
+  public function getTileMatrixSet($name, $tileMatrixSet, $crs = 'EPSG:3857'){
+    $srs = explode(':', $crs);
+    $TileMatrixSet = '<TileMatrixSet>
+      <ows:Title>' . $name . '</ows:Title>
+      <ows:Abstract>' . $name . ' '. $crs .'</ows:Abstract>
+      <ows:Identifier>' . $name . '</ows:Identifier>
+      <ows:SupportedCRS>urn:ogc:def:crs:'.$srs[0].'::'.$srs[1].'</ows:SupportedCRS>';
+   // <WellKnownScaleSet>urn:ogc:def:wkss:OGC:1.0:GoogleMapsCompatible</WellKnownScaleSet>;
+    foreach($tileMatrixSet as $level){
+    $TileMatrixSet .= '
+      <TileMatrix>
+        <ows:Identifier>' . $level['id'] . '</ows:Identifier>
+        <ScaleDenominator>' .  $level['scale_denominator'] . '</ScaleDenominator>
+        <TopLeftCorner>'.  $level['origin'][0] . ' ' .  $level['origin'][1] .'</TopLeftCorner>
+        <TileWidth>' .  $level['tile_size'][0] . '</TileWidth>
+        <TileHeight>' .  $level['tile_size'][1] . '</TileHeight>
+        <MatrixWidth>' . $level['matrix_size'][0] . '</MatrixWidth>
+        <MatrixHeight>' .  $level['matrix_size'][1] . '</MatrixHeight>
+      </TileMatrix>';
+    }
+    $TileMatrixSet .= '</TileMatrixSet>';
+
+    return $TileMatrixSet;
+  }
+
+  /**
+   * Returns tilesets getCapabilities
+   */
+  public function getCapabilities() {
+
+    $layers = array_merge($this->fileLayer, $this->dbLayer);
+
+    //if TileMatrixSet is provided validate it
+    for($i = 0; $i < count($layers); $i++){
+      if($layers[$i]['profile'] == 'custom'){
+        $layers[$i]['tile_matrix'] = $this->parseTileMatrix(
+            $layers[$i],
+            $layers[$i]['tile_matrix']
+        );
+      }
+    }
+
+    header('Content-type: application/xml');
+    echo '<?xml version="1.0" encoding="UTF-8" ?>
+<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:gml="http://www.opengis.net/gml" xsi:schemaLocation="http://www.opengis.net/wmts/1.0 http://schemas.opengis.net/wmts/1.0/wmtsGetCapabilities_response.xsd" version="1.0.0">
+  <!-- Service Identification -->
+  <ows:ServiceIdentification>
+    <ows:Title>tileserverphp</ows:Title>
+    <ows:ServiceType>OGC WMTS</ows:ServiceType>
+    <ows:ServiceTypeVersion>1.0.0</ows:ServiceTypeVersion>
+  </ows:ServiceIdentification>
+  <!-- Operations Metadata -->
+  <ows:OperationsMetadata>
+    <ows:Operation name="GetCapabilities">
+      <ows:DCP>
+        <ows:HTTP>
+          <ows:Get xlink:href="' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/wmts/1.0.0/WMTSCapabilities.xml">
+            <ows:Constraint name="GetEncoding">
+              <ows:AllowedValues>
+                <ows:Value>RESTful</ows:Value>
+              </ows:AllowedValues>
+            </ows:Constraint>
+          </ows:Get>
+          <!-- add KVP binding in 10.1 -->
+          <ows:Get xlink:href="' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/wmts?">
+            <ows:Constraint name="GetEncoding">
+              <ows:AllowedValues>
+                <ows:Value>KVP</ows:Value>
+              </ows:AllowedValues>
+            </ows:Constraint>
+          </ows:Get>
+        </ows:HTTP>
+      </ows:DCP>
+    </ows:Operation>
+    <ows:Operation name="GetTile">
+      <ows:DCP>
+        <ows:HTTP>
+          <ows:Get xlink:href="' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/wmts/">
+            <ows:Constraint name="GetEncoding">
+              <ows:AllowedValues>
+                <ows:Value>RESTful</ows:Value>
+              </ows:AllowedValues>
+            </ows:Constraint>
+          </ows:Get>
+          <ows:Get xlink:href="' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/wmts?">
+            <ows:Constraint name="GetEncoding">
+              <ows:AllowedValues>
+                <ows:Value>KVP</ows:Value>
+              </ows:AllowedValues>
+            </ows:Constraint>
+          </ows:Get>
+        </ows:HTTP>
+      </ows:DCP>
+    </ows:Operation>
+  </ows:OperationsMetadata>
+  <Contents>';
+
+    $customtileMatrixSets = '';
+    $maxMercatorZoom = 18;
+
+    //layers
+    foreach ($layers as $m) {
+
+      $basename = $m['basename'];
+      $title = (array_key_exists('name', $m)) ? $m['name'] : $basename;
+      $profile = $m['profile'];
+      $bounds = $m['bounds'];
+      $format = $m['format'] == 'hybrid' ? 'jpgpng' : $m['format'];
+      $mime = ($format == 'jpg') ? 'image/jpeg' : 'image/' . $format;
+
+      if ($profile == 'geodetic') {
+        $tileMatrixSet = 'WGS84';
+      }elseif ($m['profile'] == 'custom') {
+        $crs = explode(':', $m['crs']);
+        $tileMatrixSet = 'custom' . $crs[1] . $m['basename'];
+        $customtileMatrixSets .= $this->getTileMatrixSet(
+                $tileMatrixSet,
+                $m['tile_matrix'],
+                $m['crs']
+                );
+      } else {
+        $tileMatrixSet = 'GoogleMapsCompatible';
+        $maxMercatorZoom = max($maxMercatorZoom, $m['maxzoom']);
+      }
+
+      $wmtsHost = substr($m['tiles'][0], 0, strrpos($m['tiles'][0], $m['basename']));
+      $resourceUrlTemplate = $wmtsHost . $basename
+              . '/{TileMatrix}/{TileCol}/{TileRow}';
+      if(strlen($format) <= 4){
+        $resourceUrlTemplate .= '.' . $format;
+      }
+
+      echo'
+    <Layer>
+      <ows:Title>' . $title . '</ows:Title>
+      <ows:Identifier>' . $basename . '</ows:Identifier>
+      <ows:WGS84BoundingBox crs="urn:ogc:def:crs:OGC:2:84">
+        <ows:LowerCorner>' . $bounds[0] . ' ' . $bounds[1] . '</ows:LowerCorner>
+        <ows:UpperCorner>' . $bounds[2] . ' ' . $bounds[3] . '</ows:UpperCorner>
+      </ows:WGS84BoundingBox>
+      <Style isDefault="true">
+        <ows:Identifier>default</ows:Identifier>
+      </Style>
+      <Format>' . $mime . '</Format>
+      <TileMatrixSetLink>
+        <TileMatrixSet>' . $tileMatrixSet . '</TileMatrixSet>
+      </TileMatrixSetLink>
+      <ResourceURL format="' . $mime . '" resourceType="tile" template="' . $resourceUrlTemplate . '"/>
+    </Layer>';
+    }
+
+     // Print custom TileMatrixSets
+    if (strlen($customtileMatrixSets) > 0) {
+      echo $customtileMatrixSets;
+    }
+
+    // Print PseudoMercator TileMatrixSet
+    echo $this->getMercatorTileMatrixSet($maxMercatorZoom);
+
+    // Print WGS84 TileMatrixSet
+    echo $this->getWGS84TileMatrixSet();
+
+  echo '</Contents>
+  <ServiceMetadataURL xlink:href="' . $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/wmts/1.0.0/WMTSCapabilities.xml"/>
+</Capabilities>';
+  }
+
+  /**
+   * Returns tile via WMTS specification
+   */
+  public function getTile() {
+    $request = $this->getGlobal('Request');
+    if ($request) {
+      if (strpos('/', $_GET['Format']) !== false) {
+        $format = explode('/', $_GET['Format']);
+        $format = $format[1];
+      } else {
+        $format = $this->getGlobal('Format');
+      }
+      parent::renderTile(
+              $this->getGlobal('Layer'),
+              $this->getGlobal('TileMatrix'),
+              $this->getGlobal('TileRow'),
+              $this->getGlobal('TileCol'),
+              $format
+              );
+    } else {
+      parent::renderTile($this->layer, $this->z, $this->y, $this->x, $this->ext);
+    }
+  }
+
+}
+
+/**
+ * Tile map service
+ */
+class Tms extends Server {
+
+  /**
+   * @param array $params
+   */
+  public $layer;
+
+  /**
+   * @var integer
+   */
+  public $z;
+
+  /**
+   * @var integer
+   */
+  public $y;
+
+  /**
+   * @var integer
+   */
+  public $x;
+
+  /**
+   * @var string
+   */
+  public $ext;
+
+  /**
+   *
+   * @param array $params
+   */
+  public function __construct($params) {
+    parent::__construct();
+    parent::setParams($params);
+  }
+
+  /**
+   * Returns getCapabilities metadata request
+   */
+  public function getCapabilities() {
+    parent::setDatasets();
+    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    header('Content-type: application/xml');
+    echo'<TileMapService version="1.0.0"><TileMaps>';
+    foreach ($maps as $m) {
+      $basename = $m['basename'];
+      $title = (array_key_exists('name', $m) ) ? $m['name'] : $basename;
+      $profile = $m['profile'];
+      if ($profile == 'geodetic') {
+        $srs = 'EPSG:4326';
+      } else {
+        $srs = 'EPSG:3857';
+      }
+      $url = $this->config['protocol'] . '://' . $this->config['baseUrls'][0]
+              . '/tms/' . $basename;
+      echo '<TileMap title="' . $title . '" srs="' . $srs
+        . '" type="InvertedTMS" ' . 'profile="global-' . $profile
+        . '" href="' . $url . '" />';
+    }
+    echo '</TileMaps></TileMapService>';
+  }
+
+  /**
+   * Prints metadata about layer
+   */
+  public function getLayerCapabilities() {
+    parent::setDatasets();
+    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    foreach ($maps as $map) {
+      if (strpos($map['basename'], $this->layer) !== false) {
+        $m = $map;
+        break;
+      }
+    }
+    $title = (array_key_exists('name', $m)) ? $m['name'] : $m['basename'];
+    $description = (array_key_exists('description', $m)) ? $m['description'] : "";
+    $bounds = $m['bounds'];
+    if ($m['profile'] == 'geodetic') {
+      $srs = 'EPSG:4326';
+      $initRes = 0.703125;
+    } elseif ($m['profile'] == 'custom') {
+      $srs = $m['crs'];
+      $bounds = $m['extent'];
+      if(isset($m['tile_matrix'][0]['pixel_size'][0])){
+        $initRes = $m['tile_matrix'][0]['pixel_size'][0];
+      }else{
+        $initRes = 1;
+      }
+    } else {
+      $srs = 'EPSG:3857';
+      $bounds = [-20037508.34,-20037508.34,20037508.34,20037508.34];
+      $initRes = 156543.03392804062;
+    }
+    $mime = ($m['format'] == 'jpg') ? 'image/jpeg' : 'image/png';
+    header("Content-type: application/xml");
+    $serviceUrl = $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/' . $m['basename'];
+    echo '<TileMap version="1.0.0" tilemapservice="' . $serviceUrl . '" type="InvertedTMS">
+  <Title>' . htmlspecialchars($title) . '</Title>
+  <Abstract>' . htmlspecialchars($description) . '</Abstract>
+  <SRS>' . $srs . '</SRS>
+  <BoundingBox minx="' . $bounds[0] . '" miny="' . $bounds[1] . '" maxx="' . $bounds[2] . '" maxy="' . $bounds[3] . '" />
+  <Origin x="' . $bounds[0] . '" y="' . $bounds[1] . '"/>
+  <TileFormat width="256" height="256" mime-type="' . $mime . '" extension="' . $m['format'] . '"/>
+  <TileSets profile="global-' . $m['profile'] . '">';
+    for ($zoom = $m['minzoom']; $zoom < $m['maxzoom'] + 1; $zoom++) {
+      $res = $initRes / pow(2, $zoom);
+      $url = $this->config['protocol'] . '://' . $this->config['baseUrls'][0] . '/' . $m['basename'] . '/' . $zoom;
+      echo '<TileSet href="' . $url . '" units-per-pixel="' . $res . '" order="' . $zoom . '" />';
+    }
+    echo'</TileSets></TileMap>';
+  }
+
+  /**
+   * Process getTile request
+   */
+  public function getTile() {
+    parent::renderTile($this->layer, $this->z, $this->y, $this->x, $this->ext);
+  }
+}
+
+/**
+ * Simple router
+ */
+class Router {
+
+  /**
+   * @param array $routes
+   */
+  public static function serve($routes) {
+    $path_info = '/';
+	global $config;
+	$xForwarded = false;
+	if (isset($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+		if ($_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https') {
+			$xForwarded = true;
 		}
-
-		foreach (array($request_uri, $request_uri_without) as $request) {
-			// replace :controller, :action (etc) with the regexps defined in $this->conditions
-			$url_regex = preg_replace_callback('@:[\w]+@', array($this, 'regex_url'), $url);
-			$url_regex .= '/?';
-
-			if (preg_match('@^' . $url_regex . '$@', $request, $p_values)) {
-				array_shift($p_values);
-				foreach ($p_names as $value) {
-					$key                = substr($value, 1);
-					$this->params[$key] = urldecode($p_values[$key]);
-				}
-				foreach ($target as $key => $value) {
-					$this->params[$key] = $value;
-				}
-				$this->is_matched = TRUE;
-				break;
-			}
-		}
-
-		unset($p_names);
-		unset($p_values);
 	}
+	$config['protocol'] = ((isset($_SERVER['HTTPS']) or (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443)) or $xForwarded) ? 'https' : 'http';
+    if (!empty($_SERVER['PATH_INFO'])) {
+      $path_info = $_SERVER['PATH_INFO'];
+    } else if (!empty($_SERVER['ORIG_PATH_INFO']) && strpos($_SERVER['ORIG_PATH_INFO'], 'tileserver.php') === false) {
+      $path_info = $_SERVER['ORIG_PATH_INFO'];
+    } else if (!empty($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], '/tileserver.php') !== false) {
+      $path_info = $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
+      $config['baseUrls'][0] = $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'] . '?';
+    } else {
+      if (!empty($_SERVER['REQUEST_URI'])) {
+        $path_info = (strpos($_SERVER['REQUEST_URI'], '?') > 0) ? strstr($_SERVER['REQUEST_URI'], '?', true) : $_SERVER['REQUEST_URI'];
+      }
+    }
+    $discovered_handler = null;
+    $regex_matches = [];
 
-	function regex_url($matches) {
-		$key = str_replace(':', '', $matches[0]);
-		if (array_key_exists($key, $this->conditions)) {
-			// use named subpatterns so we can obtain any matches by name
-			return '(?P<' . $key . '>' . $this->conditions[$key] . ')';
-		} else {
-			return '([a-zA-Z0-9_\+\-%]+)';
-		}
-	}
+    if ($routes) {
+      $tokens = [
+          ':string' => '([a-zA-Z]+)',
+          ':number' => '([0-9]+)',
+          ':alpha' => '([a-zA-Z0-9-_@\.]+)'
+      ];
+      //global $config;
+      foreach ($routes as $pattern => $handler_name) {
+        $pattern = strtr($pattern, $tokens);
+        if (preg_match('#/?' . $pattern . '/?$#', $path_info, $matches)) {
+          if (!isset($config['baseUrls'])) {
+            $config['baseUrls'][0] = $_SERVER['HTTP_HOST'] . preg_replace('#/?' . $pattern . '/?$#', '', $path_info);
+          }
+          $discovered_handler = $handler_name;
+          $regex_matches = $matches;
+          break;
+        }
+      }
+    }
+    $handler_instance = null;
+    if ($discovered_handler) {
+      if (is_string($discovered_handler)) {
+        if (strpos($discovered_handler, ':') !== false) {
+          $discoverered_class = explode(':', $discovered_handler);
+          $discoverered_method = explode(':', $discovered_handler);
+          $handler_instance = new $discoverered_class[0]($regex_matches);
+          call_user_func([$handler_instance, $discoverered_method[1]]);
+        } else {
+          $handler_instance = new $discovered_handler($regex_matches);
+        }
+      } elseif (is_callable($discovered_handler)) {
+        $handler_instance = $discovered_handler();
+      }
+    } else {
+      if (!isset($config['baseUrls'][0])) {
+        $config['baseUrls'][0] = $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
+      }
+      if (strpos($_SERVER['REQUEST_URI'], '=') != false) {
+        $kvp = explode('=', $_SERVER['REQUEST_URI']);
+        $_GET['callback'] = $kvp[1];
+        $params[0] = 'index';
+        $handler_instance = new Json($params);
+        $handler_instance->getJson();
+      }
+      $handler_instance = new Server;
+      $handler_instance->getHtml();
+    }
+  }
+
 }
